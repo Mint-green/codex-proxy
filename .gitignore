@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Configs (contain API keys)
+configs/*.toml
+!configs/*.example.toml
+
+# Reference material
+reference/
+
+# Logs & debug
+logs/
+*.log
+
+# Traces (runtime output)
+traces-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude Code internal
+.claude/
+# Codex
+.codex/
+
+# Environment
+.env
+.env.local

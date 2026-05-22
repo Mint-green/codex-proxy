@@ -1,0 +1,68 @@
+# Codex Desktop config — 参考模板
+# 使用位置: ~/.codex/config.toml (Windows: C:\Users\<user>\.codex\config.toml)
+#
+# 架构: Codex 直连三个独立 proxy，不再经过 LiteLLM 统一网关
+#   Codex → deepseek-relay (5555) → DeepSeek API
+#   Codex → minimax-relay  (5556) → MiniMax API
+#   Codex → mimo-relay     (5557) → MiMo API
+#
+# Codex Desktop 不支持 UI 切换自定义 provider，修改 model_provider 后重启生效。
+
+model = "gpt-5.5"
+model_provider = "deepseek-relay"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+
+# ── Providers ──
+
+[model_providers.deepseek-relay]
+name = "DeepSeek Relay"
+base_url = "http://127.0.0.1:5555/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[model_providers.minimax-relay]
+name = "MiniMax Relay"
+base_url = "http://127.0.0.1:5556/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[model_providers.mimo-relay]
+name = "MiMo Relay"
+base_url = "http://127.0.0.1:5557/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+# ── Model capabilities （上下文、模态等配置）──
+
+[model_properties."gpt-5.5"]
+context_window = 262144
+max_context_window = 1048576
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+input_modalities = ["text"]
+
+[model_properties."gpt-5.4"]
+context_window = 262144
+max_context_window = 1048576
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+input_modalities = ["text"]
+
+# ── Profiles (CLI 可用: codex --profile minimax) ──
+
+[profiles.ds]
+model = "gpt-5.5"
+model_provider = "deepseek-relay"
+
+[profiles.ds-flash]
+model = "gpt-5.4"
+model_provider = "deepseek-relay"
+
+[profiles.minimax]
+model = "gpt-5.5"
+model_provider = "minimax-relay"
+
+[profiles.mimo]
+model = "gpt-5.5"
+model_provider = "mimo-relay"
