@@ -47,6 +47,8 @@ port = 5555                     # 代理监听端口
 base_url = "https://api.deepseek.com/v1"   # 上游 Chat API 地址
 api_key = "sk-..."                          # 上游 API Key
 timeout = 120                               # 请求超时（秒）
+# reasoning_format = "field"               # 可选，reasoning 注入格式。默认 "field"（separate field）
+                                           # "think_tags" = MiniMax 风格（<think> 标签）
 
 [models]
 "gpt-5.5" = "deepseek-v4-pro"   # Codex 模型名 → 上游模型名
@@ -70,6 +72,7 @@ dir = "traces-deepseek"         # trace 文件目录（含 SQLite reasoning 库�
 | `[upstream]` | `base_url` | 是 | 上游 Chat Completions API 地址（需含 `/v1`） |
 | `[upstream]` | `api_key` | 是 | 上游 API Key |
 | `[upstream]` | `timeout` | 否 | HTTP 超时秒数，默认 120 |
+| `[upstream]` | `reasoning_format` | 否 | reasoning 注入格式：`"field"`（默认，separate field，DeepSeek 适用）或 `"think_tags"`（`<think>` 标签，MiniMax 适用） |
 | `[models]` | 键值对 | 是 | Codex 模型名 → 上游模型名映射 |
 | `[reasoning]` | 键值对 | 否 | reasoning_effort 值映射。不配置则透传；配置了但某档位不映射则丢弃 |
 | `[traces]` | `dir` | 是 | Trace 文件 & SQLite 库的存储目录 |
@@ -105,35 +108,55 @@ Codex 发来的 Responses API 请求包含 `input` 数组（items），其中有
 上游返回 Chat API 响应后，代理将其转为 Responses API 的事件流：
 
 - Chat `choices[0].delta.content` → `response.output_text.delta`
-- Chat `choices[0].delta.reasoning_content` → `response.output_item.added (type: reasoning, summary: [...])`（流式）
+- Chat `choices[0].delta.reasoning_content`（DeepSeek）→ `response.output_item.added (type: reasoning, summary: [...])`（流式）
+- Chat `choices[0].delta.content` 中 `<think>` 标签（MiniMax）→ 提取后作为 `response.output_item.added (type: reasoning)` 单独发出，剩余纯文本作为 message 内容
 - Chat `choices[0].delta.tool_calls` → `response.output_item.added (type: function_call)` + `response.function_call_arguments.delta` + `response.output_item.done`
 - 非流式同理，在 `output` 数组中放置 `reasoning`、`message`、`function_call` 项
 
 ### Thinking / Reasoning 处理
 
-**背景：** DeepSeek 等模型在思考模式下通过 `reasoning_content` 字段返回思维链。对于发生过工具调用的轮次，DeepSeek 要求在后续请求中将 `reasoning_content` 回传给 API，否则可能影响推理连续性。
+**背景：** 不同厂商返回思维链的方式不同：DeepSeek 通过独立的 `reasoning_content` 字段返回，MiniMax 则把思维包在 `<think>...</think>` 标签里随 `content` 返回。对于发生过工具调用的轮次，DeepSeek 要求后续请求中将 `reasoning_content` 回传 API，MiniMax 则需把思维链作为 `<think>` 标签注入 assistant 消息的 content 开头。
 
 **本代理的处理：**
 
-组件：SessionStore（内存 dict）+ ReasoningDB（SQLite）。两者配合保证 reasoning 跨会话恢复。
+**提取阶段**（响应返回时）：
+- **DeepSeek**：`reasoning_content` 字段直接累加为 `accumulated_reasoning`
+- **MiniMax**：流结束后调用 `_extract_think_tags()` 从 `accumulated_text` 中分离 `<think>` 标签内容和纯文本
+
+**存储与恢复**（下次请求时）：
+
+统一的 key-value 存储（内存 dict + SQLite），key 前缀区分索引方式：
 
 ```
 写入：响应返回 → store_reasoning(call_id, reasoning_text)
-                ├── SessionStore._reasoning[call_id] = text  （内存，重启丢）
-                └── ReasoningDB.save(call_id, text)           （SQLite，持久）
+                ├── _reasoning["call:{call_id}"] = text     （内存）
+                ├── _reasoning["hash:{md5}"] = text         （content 指纹，内存）
+                ├── ReasoningDB.save("call:{call_id}", text) （SQLite 持久化）
+                └── ReasoningDB.save("hash:{md5}", text)     （SQLite 持久化）
 
-查询：构建 Chat 消息 → get_reasoning(call_id)
-           ├── SessionStore._reasoning.get(call_id)  → 命中直接返回
-           └── 未命中 → ReasoningDB.get(call_id)     → 命中则回写内存，返回
-                                                      → 未命中 → None
+查询：构建 Chat 消息时，两种命中路径：
+  1. 按 call_id 查：get_reasoning(call_id)
+     ├── _reasoning["call:{call_id}"]       → 命中返回
+     └── ReasoningDB.get("call:{call_id}")   → 命中回写内存，返回
+                                              → 未命中 → 路径 2
+  2. 按 content 指纹查（Codex 全量回放 input 项时，无 call_id）：
+     ├── _reasoning["hash:{md5(content)}"]   → 命中返回
+     └── ReasoningDB.get("hash:{md5}")        → 命中回写内存，返回
+                                              → 未命中 → None
 ```
+
+> 指纹使用 MD5（跨进程稳定），而非 Python `hash()`（进程内随机化）。
+
+恢复的 reasoning 通过 `_apply_reasoning()` 按 `reasoning_format` 配置注入：
+- `"field"`（默认）→ 写入 assistant 消息的 `reasoning_content` 字段（DeepSeek）
+- `"think_tags"` → 拼入 assistant 消息的 `content` 开头：`<think>...</think>\n\n{content}`（MiniMax）
 
 ### reasoning_effort 映射
 
 OpenAI Responses API 的 `reasoning_effort` 值（low/medium/high/xhigh）与各厂商的 effort 值定义不同。配置文件的 `[reasoning]` 段做映射：
 
 - **DeepSeek**：只支持 `high` 和 `max`，因此 low/medium/high 都映射为 `high`，xhigh 映射为 `max`
-- **MiniMax**：标准 Chat API 不支持 `reasoning_effort` 参数，不配置 `[reasoning]` 段时该参数会被丢弃
+- **MiniMax**：标准 Chat API 不支持 `reasoning_effort` 参数，无论是否配置 `[reasoning]` 段，该参数都不会传给上游（会被丢弃）。如需使用 MiniMax 的思考能力，应确保上游模型本身就开启了思考模式
 
 ## 组件与数据流
 
@@ -155,8 +178,10 @@ Codex CLI ──Responses API──→ proxy_app.py
                     │  to_chat_request()
                     │  1. load history (prev_id)
                     │  2. process input items
-                    │  3. inject reasoning (session store / SQLite)
+                    │  3. inject reasoning via _apply_reasoning()
+                    │     (session store / SQLite, fmt-aware)
                     │  4. build Chat API body
+                    │     (w/ stream_options if streaming)
                     └────────────┤
                                  │
                     ┌────────────┤
@@ -167,9 +192,11 @@ Codex CLI ──Responses API──→ proxy_app.py
                     ┌────────────┤
                     │  from_chat_response()
                     │  1. convert deltas → SSE events
-                    │  2. store reasoning (session + SQLite)
-                    │  3. save full history by response_id
-                    │  4. write trace entry (JSONL)
+                    │  2. extract reasoning (rc field or
+                    │     <think> tags by _extract_think_tags)
+                    │  3. store reasoning (session + SQLite)
+                    │  4. save full history by response_id
+                    │  5. write trace entry (JSONL)
                     └────────────┤
                                  │
               ┌──────────────────┤
@@ -184,8 +211,11 @@ Codex CLI ──Responses API──→ proxy_app.py
 
 参考 codex-relay 的 `session.rs`。API：`store_reasoning` / `get_reasoning` / `store_turn_reasoning` / `get_turn_reasoning` / `get_history` / `save_with_id` / `save`。
 
-- **call_id 索引**：`reasoning[call_id] → text`，按 tool call ID 精确查找
-- **指纹索引**：`turn_reasoning[hash(content)] → text`，按 assistant 消息文本内容查找。用于 Codex 不使用 `previous_response_id` 而是全量回放 `input` 项时的 reasoning 恢复
+统一的 `_reasoning` dict，key 带前缀区分来源：
+- **`call:{call_id}`** — 按 tool call ID 精确查找
+- **`hash:{md5}`** — 按 assistant 消息 content 的 MD5 指纹查找。用于 Codex 不使用 `previous_response_id` 而是全量回放 `input` 项时的 reasoning 恢复
+
+内存 miss 时自动走 SQLite 回写，重启后指纹索引可从 SQLite 恢复。
 
 ### ReasoningDB（SQLite 持久化）
 
@@ -193,15 +223,17 @@ Codex CLI ──Responses API──→ proxy_app.py
 
 ```sql
 CREATE TABLE reasoning (
-    call_id   TEXT PRIMARY KEY,
-    reasoning TEXT NOT NULL,
+    key        TEXT PRIMARY KEY,
+    reasoning  TEXT NOT NULL,
     created_at TEXT
 );
 ```
 
-- `INSERT OR REPLACE`，同一 call_id 幂等写入
-- 启动时零开销（不解析 trace，不重建索引）
-- 只在 `get_reasoning` 查内存 miss 时才走 SQLite，查到后回写内存
+key 前缀区分索引方式：`call:{call_id}`（工具调用索引）、`hash:{md5_hex}`（content 指纹索引，MD5 确保跨进程稳定）。两种索引同一张表、同一个内存 dict。
+
+- `INSERT OR REPLACE`，同一 key 幂等写入
+- 启动时自动迁移旧表：`call_id` → `call:{call_id}`
+- 只在内存 miss 时才走 SQLite，查到后回写内存
 
 ### Trace 记录
 
@@ -229,6 +261,7 @@ CREATE TABLE reasoning (
 | i18n 注入 | 原始 i18n 依赖构建时注入 `__CLAUDE_TAP_I18N__` 变量，副本缺失。已直接将完整翻译字典（en / zh-CN）写入页面 |
 | 新增 Token（New Input） | 顶部统计栏 + 侧边栏条目 + 单轮详情页均新增"新增输入"展示（=`input_tokens - cache_read_input_tokens`），靛蓝色标识 |
 | 语言选择器精简 | 原始支持 8 种语言，本副本仅保留 en / zh-CN 两个选项 |
+| Forwarded to 动态化 | 原始写死 "Forwarded to DeepSeek"，改为从 URL 提取 hostname 及从 trace 提取 `upstream_base_url` 动态显示 |
 
 核心交互逻辑、SSE 回放、diff 对比等功能未做改动。
 
@@ -283,3 +316,16 @@ codex-proxy/
 │   └── proxy_minimax.log
 └── README.md
 ```
+
+## 更新记录
+
+### v2 (2026-05-23)
+
+- **MiniMax 对接**：支持 `<think>` 标签式 reasoning（`_extract_think_tags` / `_apply_reasoning`），流结束自动兜底（无需 `[DONE]`），`stream_options` 获取 token 消耗
+- **`reasoning_format` 配置**：`[upstream]` 下新增字段，`"field"`（DeepSeek 默认）或 `"think_tags"`（MiniMax）
+- **Reasoning 存储统一重构**：内存 dict + SQLite 合并为单一 key-value 存储，key 前缀 `call:` / `hash:`，指纹改为 MD5（跨进程稳定），两种索引均持久化
+- **viewer 优化**：Forwarded to 动态显示实际厂商名和 base_url
+
+### v1 (2026-05-21)
+
+- 首次提交，DeepSeek 协议转换，claude-tap 可视化面板

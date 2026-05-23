@@ -1,0 +1,28 @@
+# MiniMax provider config
+
+[server]
+port = 5556
+
+[upstream]
+base_url = "https://api.minimaxi.com/v1"
+api_key = "sk-YOUR_MINIMAX_API_KEY"
+timeout = 120
+# MiniMax returns thinking as <think> tags in content field.
+# "think_tags" = wrap reasoning in <think>...</think> tags (MiniMax)
+# "field"     = inject as reasoning_content field (DeepSeek, default)
+reasoning_format = "think_tags"
+
+[models]
+"gpt-5.5" = "MiniMax-M2.7"
+"gpt-5.4" = "MiniMax-M2.5"
+
+# MiniMax standard Chat API doesn't use reasoning_effort parameter.
+# If omitted, reasoning requests from Codex will be silently dropped.
+# [reasoning]
+# low    = "low"
+# medium = "medium"
+# high   = "high"
+# xhigh  = "xhigh"
+
+[traces]
+dir = "traces-minimax"

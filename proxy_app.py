@@ -55,35 +55,52 @@ MODEL_MAP       = cfg["models"]
 REASONING_MAP   = cfg.get("reasoning", {})
 CONFIG_NAME     = config_path.stem
 TRACE_DIR       = Path(cfg["traces"]["dir"])
+# "field" = upstream uses reasoning_content field (DeepSeek)
+# "think_tags" = upstream uses <think> tags in content (MiniMax)
+REASONING_FMT   = cfg["upstream"].get("reasoning_format", "field")
 
 # ── Reasoning DB ─────────────────────────────────────────
 import sqlite3
 
 class ReasoningDB:
-    """Persistent call_id → reasoning_content store (SQLite).
-    Survives proxy restarts so tool-call reasoning is always recoverable."""
+    """Persistent key → reasoning store (SQLite). Keys are prefixed:
+    "call:{call_id}" for tool-call reasoning, "hash:{int}" for content fingerprint.
+    Survives proxy restarts."""
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS reasoning "
-            "(call_id TEXT PRIMARY KEY, reasoning TEXT NOT NULL, created_at TEXT)"
-        )
-        self._conn.commit()
+        # Check for old schema (call_id) and migrate to new (key)
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info('reasoning')")}
+        if cols and "call_id" in cols and "key" not in cols:
+            self._conn.execute(
+                "CREATE TABLE reasoning_new (key TEXT PRIMARY KEY, reasoning TEXT NOT NULL, created_at TEXT)"
+            )
+            self._conn.execute(
+                "INSERT INTO reasoning_new SELECT 'call:' || call_id, reasoning, created_at FROM reasoning"
+            )
+            self._conn.execute("DROP TABLE reasoning")
+            self._conn.execute("ALTER TABLE reasoning_new RENAME TO reasoning")
+            self._conn.commit()
+        else:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS reasoning "
+                "(key TEXT PRIMARY KEY, reasoning TEXT NOT NULL, created_at TEXT)"
+            )
+            self._conn.commit()
 
-    def get(self, call_id: str) -> Optional[str]:
+    def get(self, key: str) -> Optional[str]:
         row = self._conn.execute(
-            "SELECT reasoning FROM reasoning WHERE call_id = ?", (call_id,)
+            "SELECT reasoning FROM reasoning WHERE key = ?", (key,)
         ).fetchone()
         return row[0] if row else None
 
-    def save(self, call_id: str, reasoning: str):
-        if not reasoning or not call_id:
+    def save(self, key: str, reasoning: str):
+        if not reasoning or not key:
             return
         self._conn.execute(
-            "INSERT OR REPLACE INTO reasoning (call_id, reasoning, created_at) "
+            "INSERT OR REPLACE INTO reasoning (key, reasoning, created_at) "
             "VALUES (?, ?, ?)",
-            (call_id, reasoning, datetime.now(timezone.utc).isoformat())
+            (key, reasoning, datetime.now(timezone.utc).isoformat())
         )
         self._conn.commit()
 
@@ -122,35 +139,41 @@ http_client = httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_TIMEOUT))
 
 class SessionStore:
     """Maps response_id → accumulated message history.
-    Also stores reasoning by call_id and turn fingerprint for recovery."""
+    Unified reasoning store: key is "call:{call_id}" or "hash:{int}", backed by SQLite."""
     def __init__(self):
         self._history: dict[str, list[dict]] = {}          # response_id → [ChatMessage]
-        self._reasoning: dict[str, str] = {}               # call_id → reasoning_content
-        self._turn_reasoning: dict[int, str] = {}          # hash(content) → reasoning_content
+        self._reasoning: dict[str, str] = {}               # "call:id" | "hash:int" → reasoning
 
     def store_reasoning(self, call_id: str, reasoning: str):
         if reasoning and call_id:
-            self._reasoning[call_id] = reasoning
-            reasoning_db.save(call_id, reasoning)
+            key = f"call:{call_id}"
+            self._reasoning[key] = reasoning
+            reasoning_db.save(key, reasoning)
 
     def get_reasoning(self, call_id: str) -> Optional[str]:
-        rc = self._reasoning.get(call_id)
+        key = f"call:{call_id}"
+        rc = self._reasoning.get(key)
         if rc:
             return rc
-        rc = reasoning_db.get(call_id)
+        rc = reasoning_db.get(key)
         if rc:
-            self._reasoning[call_id] = rc
+            self._reasoning[key] = rc
         return rc
 
+    def _fingerprint(self, content: str) -> str:
+        return hashlib.md5(content.encode()).hexdigest()
+
     def store_turn_reasoning(self, assistant: dict, reasoning: str):
-        """Store reasoning by content hash so it can be recovered when Codex replays
-        conversation without previous_response_id."""
+        """Store reasoning by content fingerprint so it can be recovered when Codex
+        replays conversation without previous_response_id. Uses MD5 for stable key
+        across restarts (Python hash() is randomized per-process)."""
         if not reasoning:
             return
         content = assistant.get("content")
         if isinstance(content, str) and content:
-            key = hash(content)
-            self._turn_reasoning[key] = reasoning
+            key = f"hash:{self._fingerprint(content)}"
+            self._reasoning[key] = reasoning
+            reasoning_db.save(key, reasoning)
         for tc in (assistant.get("tool_calls") or []):
             cid = tc.get("id", "")
             if cid:
@@ -159,7 +182,14 @@ class SessionStore:
     def get_turn_reasoning(self, assistant: dict) -> Optional[str]:
         content = assistant.get("content")
         if isinstance(content, str) and content:
-            return self._turn_reasoning.get(hash(content))
+            key = f"hash:{self._fingerprint(content)}"
+            rc = self._reasoning.get(key)
+            if rc:
+                return rc
+            rc = reasoning_db.get(key)
+            if rc:
+                self._reasoning[key] = rc
+            return rc
         return None
 
     def get_history(self, response_id: str) -> list[dict]:
@@ -197,6 +227,15 @@ def _convert_usage(chat_usage: dict | None) -> dict | None:
     if "completion_tokens_details" in chat_usage:
         u["output_tokens_details"] = chat_usage["completion_tokens_details"]
     return u
+
+
+def _apply_reasoning(msg: dict, reasoning: str):
+    """Apply reasoning to a message in the format the upstream expects."""
+    if REASONING_FMT == "think_tags":
+        existing = msg.get("content") or ""
+        msg["content"] = f"<think>{reasoning}</think>\n\n{existing}" if existing else f"<think>{reasoning}</think>"
+    else:
+        msg["reasoning_content"] = reasoning
 
 
 # ═══════════════════════════════════════════════════════
@@ -280,6 +319,11 @@ def responses_to_chat(body: dict) -> dict:
     messages: list[dict] = []
     if prev_id:
         messages = deepcopy(sessions.get_history(prev_id))
+        # Convert reasoning_content to upstream format
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("reasoning_content"):
+                rc = msg.pop("reasoning_content")
+                _apply_reasoning(msg, rc)
 
     model_name = body.get("model", "")
     upstream_model = MODEL_MAP.get(model_name, model_name)
@@ -348,12 +392,12 @@ def responses_to_chat(body: dict) -> dict:
 
             msg: dict = {"role": "assistant", "content": None, "tool_calls": grouped}
             if reasoning_content:
-                msg["reasoning_content"] = reasoning_content
+                _apply_reasoning(msg, reasoning_content)
             else:
                 # Fallback: try turn-level fingerprint
                 rc = sessions.get_turn_reasoning(msg)
                 if rc:
-                    msg["reasoning_content"] = rc
+                    _apply_reasoning(msg, rc)
             messages.append(msg)
 
         elif item_type == "function_call_output":
@@ -383,11 +427,11 @@ def responses_to_chat(body: dict) -> dict:
             # Preserve reasoning_content from input item (Codex may include it)
             rc_input = item.get("reasoning_content")
             if rc_input:
-                msg["reasoning_content"] = rc_input
+                _apply_reasoning(msg, rc_input)
             elif role == "assistant":
                 rc = sessions.get_turn_reasoning(msg)
                 if rc:
-                    msg["reasoning_content"] = rc
+                    _apply_reasoning(msg, rc)
 
             # System/developer messages must go to front (interleaving fix)
             if role == "system":
@@ -413,6 +457,7 @@ def _build_chat_body(model: str, messages: list[dict], body: dict) -> dict:
 
     if body.get("stream"):
         chat_body["stream"] = True
+        chat_body["stream_options"] = {"include_usage": True}
 
     # Map reasoning.effort → upstream reasoning_effort
     raw_effort = body.get("reasoning_effort")
@@ -446,6 +491,19 @@ def _id(prefix: str) -> str:
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _extract_think_tags(text: str) -> tuple[str, str]:
+    """Extract <think>...</think> tags from text.
+    Returns (reasoning, clean_text)."""
+    import re
+    think_pattern = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+    matches = think_pattern.findall(text)
+    if not matches:
+        return "", text
+    reasoning = "\n".join(m.strip() for m in matches)
+    clean_text = think_pattern.sub("", text).strip()
+    return reasoning, clean_text
 
 
 async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
@@ -556,6 +614,13 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                             if fn.get("arguments"):
                                 entry["arguments"] += fn["arguments"]
 
+        # Extract <think> tags from accumulated text (MiniMax returns thinking in content)
+        if not accumulated_reasoning and accumulated_text:
+            extracted_reasoning, clean_text = _extract_think_tags(accumulated_text)
+            if extracted_reasoning:
+                accumulated_reasoning = extracted_reasoning
+                accumulated_text = clean_text
+
         # ── Close message item ──
         if emitted_message_item:
             yield _emit("response.output_item.done", {
@@ -620,7 +685,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                 "status": "completed"
             })
 
-        if stream_done:
+        if stream_done or accumulated_text or tool_calls:
             # ── Store reasoning for next turn ──
             for tc in _tool_calls_sorted():
                 cid = tc.get("id", "")
@@ -905,12 +970,20 @@ async def proxy_v1(request: Request, path: str):
             # Build output items
             output_items: list[dict] = []
             reasoning = msg.get("reasoning_content")
+            text = msg.get("content")
+
+            # Extract <think> tags from content (MiniMax returns thinking in content)
+            if not reasoning and text:
+                extracted_reasoning, clean_text = _extract_think_tags(text)
+                if extracted_reasoning:
+                    reasoning = extracted_reasoning
+                    text = clean_text
+
             if reasoning:
                 output_items.append({
                     "type": "reasoning",
                     "summary": [{"text": reasoning}]
                 })
-            text = msg.get("content")
             if text:
                 output_items.append({
                     "type": "message", "role": "assistant",
@@ -1131,7 +1204,10 @@ _PROXY_OUTGOING_JS = r"""
     var jsonSec = sections[sections.length - 1];
     if (jsonSec) {
       var wrapper = document.createElement('div');
-      wrapper.innerHTML = '<div style="margin:12px 0;padding:6px 12px;background:var(--blue-bg);border-radius:6px;font-size:11px;color:var(--blue);font-weight:600;">\u{1f4e4} Forwarded to DeepSeek → ' + (po.url || '') + '</div>' + html;
+      var proxiedUrl = po.url || '';
+      var host = (e.upstream_base_url || '').replace(/^https?:\/\//, '').split('/')[0] || (proxiedUrl.replace(/^https?:\/\//, '').split('/')[0]) || '';
+      var fwdLabel = host.replace(/^api\./, '').replace(/\.(com|cn|io|ai|net|org|co)$/, '') || host || 'upstream';
+      wrapper.innerHTML = '<div style="margin:12px 0;padding:6px 12px;background:var(--blue-bg);border-radius:6px;font-size:11px;color:var(--blue);font-weight:600;">\u{1f4e4} Forwarded to ' + fwdLabel + ' → ' + proxiedUrl + '</div>' + html;
       bindSections(wrapper);
       while (wrapper.firstChild) jsonSec.parentNode.insertBefore(wrapper.firstChild, jsonSec);
     }
