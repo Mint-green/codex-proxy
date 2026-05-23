@@ -12,7 +12,7 @@ Codex CLI 使用 OpenAI Responses API 格式，而大部分第三方 LLM 厂商�
 # 安装依赖
 pip install fastapi uvicorn httpx
 
-# 复制示例配置并填入你的 API Key
+# 复制示例配置并填入你的 API Key（第一次打开codex可以直接复制文件，用过的话还是建议打开文件按需复制）
 cp configs/deepseek.example.toml configs/deepseek.toml
 # 编辑 configs/deepseek.toml，将 api_key 替换为你的实际 Key
 
@@ -49,6 +49,8 @@ api_key = "sk-..."                          # 上游 API Key
 timeout = 120                               # 请求超时（秒）
 # reasoning_format = "field"               # 可选，reasoning 注入格式。默认 "field"（separate field）
                                            # "think_tags" = MiniMax 风格（<think> 标签）
+# [upstream.extra_params]                  # 可选，额外参数递归合并到 Chat API 请求体
+# thinking = {type = "enabled"}            # 例：MiMo 的 Anthropic 风格 thinking 参数
 
 [models]
 "gpt-5.5" = "deepseek-v4-pro"   # Codex 模型名 → 上游模型名
@@ -73,6 +75,7 @@ dir = "traces-deepseek"         # trace 文件目录（含 SQLite reasoning 库�
 | `[upstream]` | `api_key` | 是 | 上游 API Key |
 | `[upstream]` | `timeout` | 否 | HTTP 超时秒数，默认 120 |
 | `[upstream]` | `reasoning_format` | 否 | reasoning 注入格式：`"field"`（默认，separate field，DeepSeek 适用）或 `"think_tags"`（`<think>` 标签，MiniMax 适用） |
+| `[upstream.extra_params]` | 键值对 | 否 | 额外参数，递归深度合并到 Chat API 请求体根部。对象递归合并，基本类型/数组覆盖。例：`thinking = {type = "enabled"}`（MiMo 的 Anthropic 风格 thinking 参数） |
 | `[models]` | 键值对 | 是 | Codex 模型名 → 上游模型名映射 |
 | `[reasoning]` | 键值对 | 否 | reasoning_effort 值映射。不配置则透传；配置了但某档位不映射则丢弃 |
 | `[traces]` | `dir` | 是 | Trace 文件 & SQLite 库的存储目录 |
@@ -318,6 +321,11 @@ codex-proxy/
 ```
 
 ## 更新记录
+
+### v3 (2026-05-23)
+
+- **MiMo（小米）对接**：`thinking` 参数适配（Anthropic 风格 `{type: "enabled"}`），reasoning 格式兼容 DeepSeek 的 `reasoning_content` 字段
+- **`[upstream.extra_params]` 配置**：支持任意额外参数递归深度合并到 Chat API 请求体，适配各厂商非标扩展（如 MiMo 的 `thinking`）
 
 ### v2 (2026-05-23)
 

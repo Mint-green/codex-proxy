@@ -1,0 +1,21 @@
+# MiMo (Xiaomi) provider config
+
+[server]
+port = 5557
+
+[upstream]
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+api_key = "sk-YOUR_MIMO_API_KEY"
+timeout = 120
+
+[upstream.extra_params]
+# MiMo uses Anthropic-style thinking param (not OpenAI reasoning_effort)
+thinking = {type = "enabled"}
+
+[models]
+"gpt-5.5" = "mimo-v2.5-pro"
+"gpt-5.4" = "mimo-v2.5"
+"gpt-5.4-mini" = "mimo-v2-pro"
+
+[traces]
+dir = "traces-mimo"

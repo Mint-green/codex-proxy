@@ -58,6 +58,7 @@ TRACE_DIR       = Path(cfg["traces"]["dir"])
 # "field" = upstream uses reasoning_content field (DeepSeek)
 # "think_tags" = upstream uses <think> tags in content (MiniMax)
 REASONING_FMT   = cfg["upstream"].get("reasoning_format", "field")
+EXTRA_PARAMS    = cfg["upstream"].get("extra_params", {})
 
 # ── Reasoning DB ─────────────────────────────────────────
 import sqlite3
@@ -446,6 +447,16 @@ def responses_to_chat(body: dict) -> dict:
     return _build_chat_body(upstream_model, messages, body)
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge overlay into base. Objects are recursed, everything else is overwritten."""
+    for k, v in overlay.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 def _build_chat_body(model: str, messages: list[dict], body: dict) -> dict:
     """Build final Chat Completions request body."""
     chat_body = {"model": model, "messages": messages}
@@ -477,6 +488,9 @@ def _build_chat_body(model: str, messages: list[dict], body: dict) -> dict:
                 chat_body["max_tokens"] = body[k]
             else:
                 chat_body[k] = body[k]
+
+    if EXTRA_PARAMS:
+        _deep_merge(chat_body, EXTRA_PARAMS)
 
     return chat_body
 
@@ -849,6 +863,7 @@ async def _capture_entry(in_body: dict, out_body: dict, res_status: int,
         "duration_ms": cap["duration_ms"],
         "transport": "http",
         "upstream_base_url": UPSTREAM_BASE,
+        "config_name": CONFIG_NAME,
         "request": {
             "method": "POST",
             "path": "/v1/responses",
@@ -1206,7 +1221,7 @@ _PROXY_OUTGOING_JS = r"""
       var wrapper = document.createElement('div');
       var proxiedUrl = po.url || '';
       var host = (e.upstream_base_url || '').replace(/^https?:\/\//, '').split('/')[0] || (proxiedUrl.replace(/^https?:\/\//, '').split('/')[0]) || '';
-      var fwdLabel = host.replace(/^api\./, '').replace(/\.(com|cn|io|ai|net|org|co)$/, '') || host || 'upstream';
+      var fwdLabel = e.config_name || host || 'upstream';
       wrapper.innerHTML = '<div style="margin:12px 0;padding:6px 12px;background:var(--blue-bg);border-radius:6px;font-size:11px;color:var(--blue);font-weight:600;">\u{1f4e4} Forwarded to ' + fwdLabel + ' → ' + proxiedUrl + '</div>' + html;
       bindSections(wrapper);
       while (wrapper.firstChild) jsonSec.parentNode.insertBefore(wrapper.firstChild, jsonSec);
