@@ -265,6 +265,7 @@ key 前缀区分索引方式：`call:{call_id}`（工具调用索引）、`hash:
 | 新增 Token（New Input） | 顶部统计栏 + 侧边栏条目 + 单轮详情页均新增"新增输入"展示（=`input_tokens - cache_read_input_tokens`），靛蓝色标识 |
 | 语言选择器精简 | 原始支持 8 种语言，本副本仅保留 en / zh-CN 两个选项 |
 | Forwarded to 动态化 | 原始写死 "Forwarded to DeepSeek"，改为从 URL 提取 hostname 及从 trace 提取 `upstream_base_url` 动态显示 |
+| JSON 懒加载 | "Full JSON" 标签默认不渲染，点击展开时才构建 JSON 树，避免切 turn 时巨型 DOM 导致卡顿 |
 
 核心交互逻辑、SSE 回放、diff 对比等功能未做改动。
 
@@ -321,6 +322,11 @@ codex-proxy/
 ```
 
 ## 更新记录
+
+### v4 (2026-05-24)
+
+- **流式推理 SSE 事件标准化**：DeepSeek `reasoning_content` delta 按 OpenAI Responses API 标准翻译为 6 种推理 SSE 事件（`response.output_item.added/done`(reasoning)、`reasoning_summary_part.added/done`、`reasoning_summary_text.delta/done`），非流式路径对齐，`response.created` / `response.completed` 携带 reasoning 字段
+- **viewer JSON 懒加载**："Full JSON" 标签延迟渲染，切换 turn 不再因巨型 JSON 树卡顿
 
 ### v3 (2026-05-23)
 

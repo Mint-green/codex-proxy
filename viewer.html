@@ -1428,6 +1428,10 @@ const SIDEBAR_ORDER_MODES = ['model', 'turn'];
 const savedSidebarOrderMode = localStorage.getItem('claude-tap-sidebar-order');
 let sidebarOrderMode = SIDEBAR_ORDER_MODES.includes(savedSidebarOrderMode) ? savedSidebarOrderMode : 'model';
 
+// Lazy JSON tree: defer heavy renderJSONTree() until "Full JSON" tab is opened
+const jsonTreeCache = new Map();     // request_id → html string
+let currentDetailEntry = null;       // full entry currently displayed in detail
+
 function cloneJson(value) {
   if (value === undefined || value === null) return value;
   try { return JSON.parse(JSON.stringify(value)); } catch(e) { return value; }
@@ -3370,6 +3374,7 @@ function vsScrollToIdx(idx) {
 function selectEntry(idx, opts) {
   if (idx < 0 || idx >= filtered.length) return;
   const force = !opts || opts.force !== false;
+  const prevId = currentDetailRequestId;
   activeIdx = idx;
   if (virtualMode) {
     vsRenderVisible();
@@ -3379,11 +3384,12 @@ function selectEntry(idx, opts) {
     });
   }
   // Skip re-render if same entry and force=false (preserves scroll position in live mode)
-  if (!force && currentDetailRequestId === filtered[idx].request_id) {
+  if (!force && prevId === filtered[idx].request_id) {
     // Just update sidebar highlight, keep detail as-is
   } else {
     const entry = filtered[idx];
     const resolved = entry._isStub ? getFullEntry(entry) : entry;
+    currentDetailEntry = resolved;
     renderDetail(resolved);
   }
   if (virtualMode) {
@@ -3430,6 +3436,7 @@ function restoreSectionStates() {
       if (shouldBeOpen && !bodyEl.classList.contains('open')) {
         bodyEl.classList.add('open');
         chevron.classList.add('open');
+        _renderLazyJson(bodyEl);
       } else if (!shouldBeOpen && bodyEl.classList.contains('open')) {
         bodyEl.classList.remove('open');
         chevron.classList.remove('open');
@@ -3520,7 +3527,8 @@ function renderDetail(e) {
     const streamSection = streamEvents.length
       ? section(t('section_sse'), renderSSEEvents(streamEvents), false, null, streamEvents.length + ' ' + t('badge_events'))
       : '';
-    const jsonSection = section(t('section_json'), `<div class="json-view">${renderJSONTree(e)}</div>`, false, JSON.stringify(e, null, 2));
+    const jsonBody = `<div class="json-view json-lazy" data-lazy-json="${esc(e.request_id)}"><em style="color:var(--text-tertiary)">click to expand</em></div>`;
+    const jsonSection = section(t('section_json'), jsonBody, false, JSON.stringify(e, null, 2));
     html += actionBarHtml;
     if (usage) html += renderTokenUsage(usage);
     html += toolsSection + systemSection + messagesSection + responseSection;
@@ -4304,6 +4312,18 @@ function section(title, body, defaultOpen = true, copyText = null, badge = null)
   return `<div class="section"><div class="section-header"><span class="${ac}">&#9654;</span><span class="title">${title}</span>${extra}</div><div class="section-body ${oc}">${body}</div></div>`;
 }
 
+function _renderLazyJson(body) {
+  const lazy = body.querySelector('.json-lazy');
+  if (!lazy) return;
+  const rid = lazy.dataset.lazyJson;
+  let html = jsonTreeCache.get(rid);
+  if (!html && currentDetailEntry && currentDetailEntry.request_id === rid) {
+    html = '<div class="json-view">' + renderJSONTree(currentDetailEntry) + '</div>';
+    jsonTreeCache.set(rid, html);
+  }
+  if (html) body.innerHTML = html;
+}
+
 function bindSections(container) {
   container.querySelectorAll('.section-header').forEach(h => {
     h.addEventListener('click', ev => {
@@ -4312,8 +4332,11 @@ function bindSections(container) {
         copyToClipboard(text, ev.target);
         return;
       }
-      h.nextElementSibling.classList.toggle('open');
+      const body = h.nextElementSibling;
+      const isOpening = !body.classList.contains('open');
+      body.classList.toggle('open');
       h.querySelector('.chevron').classList.toggle('open');
+      if (isOpening) _renderLazyJson(body);
     });
   });
   container.querySelectorAll('.tool-block-header').forEach(h => {
