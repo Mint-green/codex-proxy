@@ -113,15 +113,22 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"proxy_{CONFIG_NAME}.log"
 
 from logging.handlers import RotatingFileHandler
-_handler = RotatingFileHandler(
+
+LOG_FMT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+_file_handler = RotatingFileHandler(
     str(LOG_FILE), maxBytes=1_000_000, backupCount=3, encoding="utf-8"
 )
-_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
-))
+_file_handler.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATE_FMT))
+
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATE_FMT))
+
 logger = logging.getLogger("proxy")
 logger.setLevel(logging.INFO)
-logger.addHandler(_handler)
+logger.addHandler(_file_handler)
+logger.addHandler(_stream_handler)
 logger.propagate = False
 
 import httpx
@@ -533,6 +540,10 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
     accumulated_reasoning = ""
     tool_calls: dict[int, dict] = {}  # index → {id, name, arguments}
     emitted_message_item = False
+    emitted_reasoning_item = False
+    reasoning_item_id = f"rs_{uuid.uuid4().hex[:16]}"
+    msg_output_index = 0
+    reasoning_output_index = -1
     stream_done = False
     all_chunks = []
     sse_events: list[dict] = []
@@ -545,10 +556,23 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
         return [tool_calls[k] for k in sorted(tool_calls.keys())]
 
     try:
+        # Build response reasoning echo — Codex reads this to know reasoning is present
+        resp_reasoning = {}
+        req_reasoning = in_body.get("reasoning") or {}
+        if isinstance(req_reasoning, dict):
+            resp_reasoning = {"effort": req_reasoning.get("effort", "medium")}
+        # Always include summary since we emit reasoning items
+        resp_reasoning["summary"] = "detailed"
+
         # response.created
         yield _emit("response.created", {
             "type": "response.created",
-            "response": {"id": resp_id, "status": "in_progress", "model": model}
+            "response": {
+                "id": resp_id,
+                "status": "in_progress",
+                "model": model,
+                "reasoning": resp_reasoning,
+            }
         })
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
@@ -588,15 +612,68 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                         # Reasoning content (DeepSeek thinking mode)
                         rc = delta.get("reasoning_content", "")
                         if rc:
+                            if not emitted_reasoning_item:
+                                reasoning_output_index = 0
+                                msg_output_index = 1
+                                yield _emit("response.output_item.added", {
+                                    "type": "response.output_item.added",
+                                    "output_index": 0,
+                                    "item": {
+                                        "type": "reasoning",
+                                        "id": reasoning_item_id,
+                                        "summary": []
+                                    }
+                                })
+                                # Open summary part — fires ONCE per reasoning block
+                                yield _emit("response.reasoning_summary_part.added", {
+                                    "type": "response.reasoning_summary_part.added",
+                                    "item_id": reasoning_item_id,
+                                    "output_index": 0,
+                                    "summary_index": 0,
+                                    "part": {"type": "summary_text", "text": ""}
+                                })
+                                emitted_reasoning_item = True
                             accumulated_reasoning += rc
+                            yield _emit("response.reasoning_summary_text.delta", {
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "summary_index": 0,
+                                "delta": rc
+                            })
 
                         # Text content
                         content = delta.get("content", "")
                         if content:
                             if not emitted_message_item:
+                                # Close reasoning item before starting message
+                                if emitted_reasoning_item:
+                                    yield _emit("response.reasoning_summary_text.done", {
+                                        "type": "response.reasoning_summary_text.done",
+                                        "item_id": reasoning_item_id,
+                                        "output_index": 0,
+                                        "summary_index": 0,
+                                        "text": accumulated_reasoning
+                                    })
+                                    yield _emit("response.reasoning_summary_part.done", {
+                                        "type": "response.reasoning_summary_part.done",
+                                        "item_id": reasoning_item_id,
+                                        "output_index": 0,
+                                        "summary_index": 0,
+                                        "part": {"type": "summary_text", "text": accumulated_reasoning}
+                                    })
+                                    yield _emit("response.output_item.done", {
+                                        "type": "response.output_item.done",
+                                        "output_index": 0,
+                                        "item": {
+                                            "type": "reasoning",
+                                            "id": reasoning_item_id,
+                                            "summary": [{"type": "summary_text", "text": accumulated_reasoning}]
+                                        }
+                                    })
                                 yield _emit("response.output_item.added", {
                                     "type": "response.output_item.added",
-                                    "output_index": 0,
+                                    "output_index": msg_output_index,
                                     "item": {
                                         "type": "message",
                                         "id": msg_item_id,
@@ -610,7 +687,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                             yield _emit("response.output_text.delta", {
                                 "type": "response.output_text.delta",
                                 "item_id": msg_item_id,
-                                "output_index": 0,
+                                "output_index": msg_output_index,
                                 "delta": content
                             })
 
@@ -635,11 +712,36 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                 accumulated_reasoning = extracted_reasoning
                 accumulated_text = clean_text
 
+        # Emit reasoning item if accumulated but not yet sent
+        # (reasoning-only or tool-call-only turn where no text content was streamed)
+        if accumulated_reasoning and not emitted_reasoning_item and not emitted_message_item:
+            reasoning_output_index = 0
+            msg_output_index = 1
+            yield _emit("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": reasoning_item_id,
+                    "summary": [{"type": "summary_text", "text": accumulated_reasoning}]
+                }
+            })
+            yield _emit("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": reasoning_item_id,
+                    "summary": [{"type": "summary_text", "text": accumulated_reasoning}]
+                }
+            })
+            emitted_reasoning_item = True
+
         # ── Close message item ──
         if emitted_message_item:
             yield _emit("response.output_item.done", {
                 "type": "response.output_item.done",
-                "output_index": 0,
+                "output_index": msg_output_index,
                 "item": {
                     "type": "message",
                     "id": msg_item_id,
@@ -650,7 +752,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
             })
 
         # ── Emit function_call items ──
-        base_index = 1 if emitted_message_item else 0
+        base_index = (msg_output_index + 1) if emitted_message_item else (1 if emitted_reasoning_item else 0)
         fc_items: list[dict] = []
         for rel_idx, tc in enumerate(_tool_calls_sorted()):
             fc_item_id = f"fc_{uuid.uuid4().hex[:16]}"
@@ -740,7 +842,8 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
             if accumulated_reasoning:
                 output_items.append({
                     "type": "reasoning",
-                    "summary": [{"text": accumulated_reasoning}]
+                    "id": reasoning_item_id,
+                    "summary": [{"type": "summary_text", "text": accumulated_reasoning}]
                 })
             if emitted_message_item:
                 output_items.append({
@@ -763,6 +866,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                     "id": resp_id,
                     "status": "completed",
                     "model": model,
+                    "reasoning": resp_reasoning,
                     "output": output_items,
                     "usage": usage,
                 }
@@ -773,7 +877,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
             resp_entry = {"output": output_items}
             if usage:
                 resp_entry["usage"] = usage
-            await _capture_entry(in_body, chat_body, 200, resp_entry, t0, sse_events)
+            await _capture_entry(in_body, chat_body, 200, resp_entry, t0, sse_events, all_chunks)
         else:
             # Stream incomplete
             logger.warning(f"STREAM INCOMPLETE resp_id={resp_id} — no [DONE]")
@@ -788,7 +892,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                     }
                 }
             })
-            await _capture_entry(in_body, chat_body, 0, {"error": "stream_incomplete"}, t0, sse_events)
+            await _capture_entry(in_body, chat_body, 0, {"error": "stream_incomplete"}, t0, sse_events, all_chunks)
 
     except Exception as e:
         logger.error(f"STREAM ERROR resp_id={resp_id}: {e}", exc_info=True)
@@ -800,7 +904,7 @@ async def _stream_responses(in_body: dict, chat_body: dict, t0: float):
                 "error": {"code": "proxy_error", "message": str(e)}
             }
         })
-        await _capture_entry(in_body, chat_body, 502, {"error": str(e)}, t0, sse_events)
+        await _capture_entry(in_body, chat_body, 502, {"error": str(e)}, t0, sse_events, all_chunks)
 
 
 # ═══════════════════════════════════════════════════════
@@ -836,7 +940,8 @@ async def broadcast(cap: dict):
 
 async def _capture_entry(in_body: dict, out_body: dict, res_status: int,
                          res_body: dict, t0: float,
-                         sse_events: list[dict] | None = None):
+                         sse_events: list[dict] | None = None,
+                         upstream_chunks: list[dict] | None = None):
     cap = {
         "id": str(uuid.uuid4())[:8],
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -880,6 +985,11 @@ async def _capture_entry(in_body: dict, out_body: dict, res_status: int,
     }
     if sse_events:
         entry["response"]["sse_events"] = sse_events
+        entry["response"]["sse_text"] = "".join(
+            _sse(ev["event"], ev["data"]) for ev in sse_events
+        )
+    if upstream_chunks:
+        entry["response"]["upstream_chunks"] = upstream_chunks
 
     trace_entries.append(entry)
     await broadcast(cap)
@@ -997,7 +1107,8 @@ async def proxy_v1(request: Request, path: str):
             if reasoning:
                 output_items.append({
                     "type": "reasoning",
-                    "summary": [{"text": reasoning}]
+                    "id": f"rs_{uuid.uuid4().hex[:16]}",
+                    "summary": [{"type": "summary_text", "text": reasoning}]
                 })
             if text:
                 output_items.append({
@@ -1029,12 +1140,20 @@ async def proxy_v1(request: Request, path: str):
             full_history = list(chat_body.get("messages", [])) + [assistant_msg]
             response_id = sessions.save(full_history)
 
+            # Build reasoning echo
+            nonstream_reasoning = {}
+            req_reasoning_ns = in_body.get("reasoning") or {}
+            if isinstance(req_reasoning_ns, dict):
+                nonstream_reasoning = {"effort": req_reasoning_ns.get("effort", "medium")}
+            nonstream_reasoning["summary"] = "detailed"
+
             response_obj = {
                 "id": response_id,
                 "object": "response",
                 "model": in_body.get("model", ""),
                 "created_at": int(time.time()),
                 "status": "completed",
+                "reasoning": nonstream_reasoning,
                 "output": output_items,
                 "usage": _convert_usage(chat_data.get("usage")),
             }
@@ -1473,7 +1592,8 @@ function renderMessages(inBody, resBody){
         const parts=(item.content||[]).map(p=>p.text||'').join('\n');
         if(parts) msgs.push({role:'assistant',content:parts});
       }else if(item.type==='reasoning'){
-        const text=(item.content||[]).map(p=>p.text||'').join('\n');
+        const parts = item.summary || item.content || [];
+        const text = parts.map(p=>p.text||'').join('\n');
         if(text) msgs.push({role:'system',content:text,label:'Reasoning'});
       }else if(item.type==='function_call'){
         msgs.push({role:'assistant',tool:{name:item.name||'?',call_id:item.call_id||'',args:item.arguments||''}});

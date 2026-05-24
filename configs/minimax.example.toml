@@ -15,6 +15,7 @@ reasoning_format = "think_tags"
 [models]
 "gpt-5.5" = "MiniMax-M2.7"
 "gpt-5.4" = "MiniMax-M2.5"
+"gpt-5.4-mini" = "MiniMax-M2.7"
 
 # MiniMax standard Chat API doesn't use reasoning_effort parameter.
 # If omitted, reasoning requests from Codex will be silently dropped.

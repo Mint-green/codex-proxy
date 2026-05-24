@@ -12,7 +12,7 @@ Codex CLI 使用 OpenAI Responses API 格式，而大部分第三方 LLM 厂商�
 # 安装依赖
 pip install fastapi uvicorn httpx
 
-# 复制示例配置并填入你的 API Key（第一次打开codex可以直接复制文件，用过的话还是建议打开文件按需复制）
+# 复制示例配置并填入你的 API Key
 cp configs/deepseek.example.toml configs/deepseek.toml
 # 编辑 configs/deepseek.toml，将 api_key 替换为你的实际 Key
 
